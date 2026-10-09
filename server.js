@@ -205,7 +205,9 @@ function createSession(options = {}) {
                 if (typeof session[key] !== 'function') delete session[key];
             }
 
-            res.setHeader('Set-Cookie', sessionCookie(req, '', 0));
+            if (!res.headersSent) {
+                res.setHeader('Set-Cookie', sessionCookie(req, '', 0));
+            }
             res.clearCookie(name);
 
             if (typeof callback === 'function') callback();
@@ -234,10 +236,13 @@ function createSession(options = {}) {
                             if (!sid) sid = crypto.randomBytes(24).toString('base64url');
 
                             sessionStore.set(sid, { data, expiresAt: Date.now() + maxAge });
-                            res.setHeader(
-                                'Set-Cookie',
-                                sessionCookie(req, signToken({ sid, at: Date.now() }), maxAgeSeconds)
-                            );
+                            // لو الرد انطلق (مثل sendFile/stream) ما نقدر نضيف هيدر
+                            if (!res.headersSent) {
+                                res.setHeader(
+                                    'Set-Cookie',
+                                    sessionCookie(req, signToken({ sid, at: Date.now() }), maxAgeSeconds)
+                                );
+                            }
                         }
                     }
                 } catch (e) {
@@ -456,12 +461,31 @@ module.exports = function setupDashboard(app, deps = {}) {
     // 2) standalone: ما جات deps → نبنيها من lib/bot-context.js
     //    (الداشبورد يشتغل لحاله على استضافة ثانية بتوكنه و OWNER_IDS تبعه)
     const injected = deps || {};
-    const standalone = !injected.client;
 
-    const ctxLib = standalone ? require(BOT_CONTEXT_PATH) : null;
-    const resolved = standalone
+    // الوضع المستقل: البوت ما مرّر الاعتماديات الجاهزة (يمكن بس الـ client).
+    // نعتبره مستقل إذا الدوال/الموديلات الأساسية ناقصة ونبنيها من lib/bot-context.js.
+    const hasFullDeps =
+        typeof injected.getSettings === 'function' &&
+        typeof injected.isServerAdmin === 'function' &&
+        Boolean(injected.DashboardUser);
+
+    let ctxLib = null;
+    if (!hasFullDeps) {
+        try {
+            ctxLib = require(BOT_CONTEXT_PATH);
+        } catch (e) {
+            console.error('[panel] ❌ تعذّر تحميل bot-context:', e.message);
+        }
+    }
+
+    const standalone = !hasFullDeps;
+
+    const built = ctxLib
         ? ctxLib.buildDeps({ client: injected.client, tickets: injected.tickets })
-        : injected;
+        : {};
+
+    // injected ياخذ الأولوية (نفس دوال البوت لو موجودة)، والناقص من bot-context
+    const resolved = { ...built, ...injected };
 
     // نكمل أي dep ناقص من lib حتى لو بعضهم جاي من البوت
     for (const depName of [
@@ -634,11 +658,26 @@ module.exports = function setupDashboard(app, deps = {}) {
     // HELPERS
     // ======================================================
 
+    // مهلة قاسية لأي وعد (نداء ديسكورد): لا نخلي طلب معلّق يوقف كل شي
+    function withTimeout(promise, ms, label) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms);
+            promise.then(
+                value => { clearTimeout(timer); resolve(value); },
+                err => { clearTimeout(timer); reject(err); }
+            );
+        });
+    }
+
     async function getUserGuildMember(guild, userId) {
         try {
             let member = guild.members.cache.get(userId);
             if (!member) {
-                member = await guild.members.fetch({ user: userId, cache: true, force: false });
+                member = await withTimeout(
+                    guild.members.fetch({ user: userId, cache: true, force: false }),
+                    6000,
+                    `members.fetch ${guild.id}`
+                );
             }
             return member || null;
         } catch {
@@ -781,6 +820,8 @@ module.exports = function setupDashboard(app, deps = {}) {
         if (running) return running;
 
         const task = (async () => {
+            const startedAt = Date.now();
+
             if (await isDashboardRevoked(userId)) {
                 serversCache.set(userId, { guilds: [], cachedAt: Date.now() });
                 return [];
@@ -790,14 +831,24 @@ module.exports = function setupDashboard(app, deps = {}) {
                 ? candidateIds.map(id => client.guilds.cache.get(String(id))).filter(Boolean)
                 : [...client.guilds.cache.values()];
 
-            const checked = await mapLimit(candidates, 12, async guild => (
-                (await canManage(userId, guild)) ? serverEntry(guild) : null
-            ));
+            let done = 0;
+            const checked = await mapLimit(candidates, 12, async guild => {
+                const ok = await canManage(userId, guild);
+                done++;
+                if (done % 25 === 0) {
+                    console.log(`[panel] … ${done}/${candidates.length} سيرفر (${Date.now() - startedAt}ms)`);
+                }
+                return ok ? serverEntry(guild) : null;
+            });
 
             const guilds = checked.filter(Boolean);
 
             serversCache.set(userId, { guilds, cachedAt: Date.now() });
             await saveServersToDb(userId, guilds);
+
+            console.log(
+                `[panel] ✅ جلب السيرفرات ${userId}: ${guilds.length} سيرفر من ${candidates.length} مرشّح خلال ${Date.now() - startedAt}ms`
+            );
 
             return guilds;
         })();
@@ -827,6 +878,14 @@ module.exports = function setupDashboard(app, deps = {}) {
     // التحديث بالخلفية، وأي إجراء فعلي محمي بـ canManage داخل requireGuild.
     async function filterCachedServers(userId, entries) {
         return entries.filter(entry => client.guilds.cache.has(String(entry.id)));
+    }
+
+    // آيديات السيرفرات المرشّحة من الجلسة: القائمة الكاملة (guildIds) وإلا قائمة
+    // الأدمن المحفوظة (للجلسات القديمة) — نتجنّب المرور على كل سيرفرات البوت.
+    function sessionCandidateIds(s) {
+        if (Array.isArray(s?.guildIds) && s.guildIds.length) return s.guildIds;
+        if (Array.isArray(s?.guilds) && s.guilds.length) return s.guilds.map(g => g.id);
+        return null;
     }
 
     async function accessibleServers(userId, forceRefresh = false, candidateIds = null) {
@@ -1359,7 +1418,7 @@ module.exports = function setupDashboard(app, deps = {}) {
         }
 
         // سيرفرات البوت الحقيقية (المصدر الأساسي للصلاحيات)
-        const live = await accessibleServers(s.userId, req.query.refresh === '1', s.guildIds);
+        const live = await accessibleServers(s.userId, req.query.refresh === '1', sessionCandidateIds(s));
 
         // الدمج: نترك حقول البوت (الاسم/الأيقونة/الإحصائيات) مع بيانات الجلسة
         const byId = new Map(data?.guilds?.map(g => [g.id, g]) || []);
@@ -1461,7 +1520,7 @@ module.exports = function setupDashboard(app, deps = {}) {
         if (!me) return;
 
         const force = req.query.refresh === '1';
-        const guilds = await accessibleServers(me.userId, force, me.guildIds);
+        const guilds = await accessibleServers(me.userId, force, sessionCandidateIds(me));
 
         res.json({
             ok: true,
