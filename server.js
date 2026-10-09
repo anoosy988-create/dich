@@ -40,6 +40,7 @@ const PUNISH_SHORTCUT_COMMANDS = ['ban', 'kick', 'timeout', 'jail'];
 const SESSION_COOKIE_NAME = 'dash_session';
 
 const serversCache = new Map();                // userId -> { guilds, cachedAt }
+const serversInflight = new Map();             // userId -> Promise (منع الجلب المكرر المتزامن)
 const oauthStates = new Map();                 // state -> { createdAt }
 const accessCache = new Map();                 // userId -> { revoked, at }
 const ACCESS_CACHE_TTL = 15 * 1000;            // 15 ثانية
@@ -717,6 +718,25 @@ module.exports = function setupDashboard(app, deps = {}) {
         return Boolean(guild?.ownerId) && String(guild.ownerId) === String(userId);
     }
 
+    // تنفيذ متوازٍ محدود العدد (نتجنّب ضرب rate-limit لديسكورد)
+    async function mapLimit(items, limit, fn) {
+        const out = new Array(items.length);
+        let cursor = 0;
+
+        const workers = Array.from(
+            { length: Math.max(1, Math.min(limit, items.length)) },
+            async () => {
+                while (cursor < items.length) {
+                    const index = cursor++;
+                    out[index] = await fn(items[index], index);
+                }
+            }
+        );
+
+        await Promise.all(workers);
+        return out;
+    }
+
     // شكل السيرفر الموحّد اللي ترجعه الواجهة
     function serverEntry(guild) {
         return {
@@ -752,25 +772,49 @@ module.exports = function setupDashboard(app, deps = {}) {
     }
 
     // جلب السيرفرات المجوّزة للمستخدم، وحفظها في قاعدة البيانات (كاش دائم)
-    async function fetchAccessibleServers(userId) {
-        const guilds = [];
-        for (const guild of client.guilds.cache.values()) {
-            const ok = await canManage(userId, guild);
-            if (!ok) continue;
+    // candidateIds: آيديات السيرفرات اللي المستخدم عضو فيها (من OAuth) — نفحصها
+    // بس، بدل ما نمرّ على كل سيرفرات البوت ونسوي members.fetch لكل واحد.
+    async function fetchAccessibleServers(userId, candidateIds = null) {
+        // لو فيه جلب شغّال لنفس المستخدم، ننتظر نفس النتيجة بدل ما نبدأ جلب ثاني
+        // (كان الداشبورد ينادي /api/servers و/api/stats معاً فيصير فحصين متوازيين).
+        const running = serversInflight.get(userId);
+        if (running) return running;
 
-            guilds.push(serverEntry(guild));
+        const task = (async () => {
+            if (await isDashboardRevoked(userId)) {
+                serversCache.set(userId, { guilds: [], cachedAt: Date.now() });
+                return [];
+            }
+
+            const candidates = Array.isArray(candidateIds) && candidateIds.length
+                ? candidateIds.map(id => client.guilds.cache.get(String(id))).filter(Boolean)
+                : [...client.guilds.cache.values()];
+
+            const checked = await mapLimit(candidates, 12, async guild => (
+                (await canManage(userId, guild)) ? serverEntry(guild) : null
+            ));
+
+            const guilds = checked.filter(Boolean);
+
+            serversCache.set(userId, { guilds, cachedAt: Date.now() });
+            await saveServersToDb(userId, guilds);
+
+            return guilds;
+        })();
+
+        serversInflight.set(userId, task);
+
+        try {
+            return await task;
+        } finally {
+            serversInflight.delete(userId);
         }
-
-        serversCache.set(userId, { guilds, cachedAt: Date.now() });
-        await saveServersToDb(userId, guilds);
-
-        return guilds;
     }
 
     // تحديث في الخلفية حتى لا ينتظر المستخدم عندما يكون الكاش جاهزاً
-    async function refreshServersInBackground(userId) {
+    async function refreshServersInBackground(userId, candidateIds = null) {
         try {
-            await fetchAccessibleServers(userId);
+            await fetchAccessibleServers(userId, candidateIds);
         } catch {}
     }
 
@@ -778,16 +822,14 @@ module.exports = function setupDashboard(app, deps = {}) {
     // 1) إذا كان بالذاكرة (30 دقيقة) -> فوراً
     // 2) إلا إذا لُفيت له من قبل (قاعدة البيانات) -> فوراً + تحديث بالخلفية
     // 3) غير ذلك -> يجلب ويفحص ويحفظ أول مرة
+    // فلترة سريعة للكاش: نتأكد بس إن البوت لسا داخل السيرفر — بدون فحص صلاحيات
+    // لكل سيرفر (كان يسوي members.fetch ويعطّل كل طلب). الفحص الكامل يصير عند
+    // التحديث بالخلفية، وأي إجراء فعلي محمي بـ canManage داخل requireGuild.
     async function filterCachedServers(userId, entries) {
-        const allowed = [];
-        for (const entry of entries) {
-            const guild = client.guilds.cache.get(entry.id);
-            if (guild && await canManage(userId, guild)) allowed.push(entry);
-        }
-        return allowed;
+        return entries.filter(entry => client.guilds.cache.has(String(entry.id)));
     }
 
-    async function accessibleServers(userId, forceRefresh = false) {
+    async function accessibleServers(userId, forceRefresh = false, candidateIds = null) {
         const cached = serversCache.get(userId);
         if (!forceRefresh && cached && cached.guilds.length && Date.now() - cached.cachedAt < SERVERS_CACHE_TTL) {
             const guilds = await filterCachedServers(userId, cached.guilds);
@@ -806,14 +848,14 @@ module.exports = function setupDashboard(app, deps = {}) {
                 if (saved.length) {
                     const guilds = await filterCachedServers(userId, saved);
                     serversCache.set(userId, { guilds: saved, cachedAt: Date.now() });
-                    refreshServersInBackground(userId);
+                    refreshServersInBackground(userId, candidateIds);
                     return guilds;
                 }
             } catch {}
         }
 
-        // أول مرة: نجلب ونفحص كل سيرفر (أدمن أو ستريتر فقط) ثم نحفظها.
-        return fetchAccessibleServers(userId);
+        // أول مرة: نجلب ونفحص السيرفرات (أدمن أو ستريتر فقط) ثم نحفظها.
+        return fetchAccessibleServers(userId, candidateIds);
     }
 
     // مالك الداشبورد: OWNER_IDS (مفصولة بفاصلة) أو OWNER_ID
@@ -1224,11 +1266,15 @@ module.exports = function setupDashboard(app, deps = {}) {
 
         // ===== 3) جلب قائمة السيرفرات من /users/@me/guilds ثم الفلترة بصلاحية Administrator =====
         let oauthGuilds = [];
+        let oauthGuildIds = [];
         try {
             const raw = await discordRequest(`${DISCORD_API}/users/@me/guilds`, {
                 headers: { Authorization: `Bearer ${oauth.access_token}` }
             });
             oauthGuilds = filterAdminGuilds(raw, client);
+            // كل السيرفرات اللي المستخدم عضو فيها (قبل فلترة الأدمن) — نستخدمها
+            // كمجموعة مرشّحين حتى نفحص سيرفرات المستخدم بس، مو كل سيرفرات البوت.
+            oauthGuildIds = Array.isArray(raw) ? raw.map(g => String(g.id)) : [];
         } catch (e) {
             notifyFailedLogin(req, `تعذّر جلب السيرفرات: ${safeLogValue(e.message, 200)}`).catch(() => {});
             // ما نمنع الدخول — الفلترة الحقيقية تتم على بيانات البوت
@@ -1246,6 +1292,7 @@ module.exports = function setupDashboard(app, deps = {}) {
             tokenType: oauth.token_type || 'Bearer',
             scopes: oauth.scope || OAUTH_SCOPES,
             guilds: oauthGuilds,
+            guildIds: oauthGuildIds,
             guildsFetchedAt: Date.now(),
             loggedInAt: Date.now()
         };
@@ -1254,7 +1301,7 @@ module.exports = function setupDashboard(app, deps = {}) {
         notifyDashboardLogin(req, userId, account).catch(() => {});
 
         // جهّز السيرفرات لحساب المستخدم أول ما يدخل (بدون ما يستنى)
-        refreshServersInBackground(userId);
+        refreshServersInBackground(userId, oauthGuildIds);
 
         return res.redirect('/#home');
 
@@ -1312,7 +1359,7 @@ module.exports = function setupDashboard(app, deps = {}) {
         }
 
         // سيرفرات البوت الحقيقية (المصدر الأساسي للصلاحيات)
-        const live = await accessibleServers(s.userId, req.query.refresh === '1');
+        const live = await accessibleServers(s.userId, req.query.refresh === '1', s.guildIds);
 
         // الدمج: نترك حقول البوت (الاسم/الأيقونة/الإحصائيات) مع بيانات الجلسة
         const byId = new Map(data?.guilds?.map(g => [g.id, g]) || []);
@@ -1414,7 +1461,7 @@ module.exports = function setupDashboard(app, deps = {}) {
         if (!me) return;
 
         const force = req.query.refresh === '1';
-        const guilds = await accessibleServers(me.userId, force);
+        const guilds = await accessibleServers(me.userId, force, me.guildIds);
 
         res.json({
             ok: true,
